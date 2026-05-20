@@ -13,22 +13,24 @@ SESSIONS_DIR = Path.home() / ".wortschatz" / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Global Session Storage ─────────────────────────────────────────────────────
-# Everything stored here vanishes when you kill the CLI server.
 IN_MEMORY_DB = {}
 nlp = None
+CURRENT_MODEL = "de_core_news_md"
+LOADED_MODEL_NAME = None
 
 def load_model():
-    global nlp
-    if nlp is not None:
+    global nlp, CURRENT_MODEL, LOADED_MODEL_NAME
+    if nlp is not None and LOADED_MODEL_NAME == CURRENT_MODEL:
         return True, ""
     try:
         import spacy
         try:
-            nlp = spacy.load("de_core_news_sm")
+            nlp = spacy.load(CURRENT_MODEL)
             nlp.max_length = 5_000_000
+            LOADED_MODEL_NAME = CURRENT_MODEL
             return True, ""
         except OSError:
-            return False, "Modell nicht gefunden. Führe aus: python -m spacy download de_core_news_sm"
+            return False, f"Modell nicht gefunden. Führe aus: python -m spacy download {CURRENT_MODEL}"
     except ImportError:
         return False, "spaCy fehlt. Führe aus: pip install spacy"
 
@@ -114,42 +116,47 @@ def analyze_text(text: str):
 
     return {"raw": raw_list, "lemma": lemma_list, "total_tokens": total_tokens, "unique_forms": len(raw_list), "unique_lemmas": len(lemma_list)}
 
+def pre_load_path(path_str: str):
+    """Liest Dateien von der Kommandozeile ein und fügt sie der In-Memory-DB hinzu."""
+    path = Path(path_str)
+    if not path.exists():
+        print(f"  ✗ Pfad nicht gefunden: {path_str}")
+        return
 
-# ── CLI Pre-Loader ─────────────────────────────────────────────────────────────
-def pre_load_path(path):
-    if os.path.isfile(path) and path.lower().endswith(('.txt', '.srt')):
-        _load_file(path)
-    elif os.path.isdir(path):
-        for root, dirs, files in os.walk(path):
-            for f in files:
-                if f.lower().endswith(('.txt', '.srt')):
-                    _load_file(os.path.join(root, f))
-    else:
-        print(f"  ! Ignoriert (kein Text/Ordner): {path}")
+    # Treat single files or directories
+    files_to_process = [path] if path.is_file() else path.rglob("*")
 
-def _load_file(filepath):
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read()
-        filename = os.path.basename(filepath)
+    for fpath in files_to_process:
+        if not fpath.is_file():
+            continue
 
-        text = parse_text(content, filename)
-        if len(text.strip()) < 10: return
+        fname = fpath.name
+        if not fname.lower().endswith((".txt", ".srt")):
+            continue
 
-        res = analyze_text(text)
-        res["filename"] = filename
+        try:
+            raw_bytes = fpath.read_bytes()
+            try:
+                content = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                content = raw_bytes.decode("latin-1", errors="replace")
 
-        # Deduplicate filename for the dropdown if needed
-        base_name = filename
-        idx = 1
-        while base_name in IN_MEMORY_DB:
-            base_name = f"{filename} ({idx})"
-            idx += 1
+            text = parse_text(content, fname)
+            if len(text.strip()) < 10:
+                continue
 
-        IN_MEMORY_DB[base_name] = res
-        print(f"  ✓ {base_name} analysiert ({res['total_tokens']} Tokens)")
-    except Exception as e:
-        print(f"  ✗ Fehler bei {filepath}: {e}")
+            res = analyze_text(text)
+            res["filename"] = fname
+
+            base_name = fname
+            idx = 1
+            while base_name in IN_MEMORY_DB:
+                base_name = f"{fname} ({idx})"
+                idx += 1
+
+            IN_MEMORY_DB[base_name] = res
+        except Exception as e:
+            print(f"  ✗ Fehler beim Lesen von {fname}: {e}")
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -157,7 +164,19 @@ def _load_file(filepath):
 def index():
     ok, err = load_model()
     files = list(IN_MEMORY_DB.keys())
-    return render_template_string(HTML, model_ok=ok, model_error=err, initial_files=json.dumps(files))
+    return render_template_string(HTML, model_ok=ok, model_error=err, initial_files=json.dumps(files), current_model=CURRENT_MODEL)
+
+@app.route("/api/model", methods=["POST"])
+def set_model():
+    global CURRENT_MODEL
+    data = request.get_json(silent=True) or {}
+    req_model = data.get("model")
+    if req_model not in ["de_core_news_sm", "de_core_news_md", "de_core_news_lg"]:
+        return jsonify({"error": "Ungültiges Modell"}), 400
+
+    CURRENT_MODEL = req_model
+    ok, err = load_model()
+    return jsonify({"ok": ok, "error": err, "model": CURRENT_MODEL})
 
 @app.route("/api/upload", methods=["POST"])
 def upload():
@@ -200,6 +219,97 @@ def get_file(fname):
         return jsonify(IN_MEMORY_DB[fname])
     return jsonify({"error": "Datei nicht im Speicher."}), 404
 
+@app.route("/api/files/<path:fname>", methods=["DELETE"])
+def delete_file(fname):
+    if fname in IN_MEMORY_DB:
+        del IN_MEMORY_DB[fname]
+        return jsonify({"ok": True, "files": list(IN_MEMORY_DB.keys())})
+    return jsonify({"error": "Datei nicht im Speicher."}), 404
+
+@app.route("/api/files/<path:fname>/edit", methods=["POST"])
+def edit_word(fname):
+    if fname not in IN_MEMORY_DB:
+        return jsonify({"error": "Datei nicht im Speicher."}), 404
+
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+    old_val = data.get("old_val")
+    new_val = (data.get("new_val") or "").strip()
+
+    if mode not in ("raw", "lemma") or not old_val or not new_val or old_val == new_val:
+        return jsonify({"error": "Ungültige Eingabe."}), 400
+
+    db_entry = IN_MEMORY_DB[fname]
+    target_list = db_entry.get(mode, [])
+
+    old_idx, existing_idx = -1, -1
+    for i, item in enumerate(target_list):
+        key = item.get("word") if mode == "raw" else item.get("lemma")
+        if key == old_val: old_idx = i
+        elif key == new_val: existing_idx = i
+
+    if old_idx == -1: return jsonify({"error": "Wort nicht gefunden."}), 404
+
+    if existing_idx != -1:
+        old_item = target_list[old_idx]
+        target_list[existing_idx]["count"] += old_item["count"]
+        for ex in old_item.get("examples", []):
+            if ex not in target_list[existing_idx]["examples"]:
+                target_list[existing_idx]["examples"].append(ex)
+
+        if mode == "lemma":
+            existing_forms = {f["form"]: f["count"] for f in target_list[existing_idx].get("forms", [])}
+            for f in old_item.get("forms", []):
+                existing_forms[f["form"]] = existing_forms.get(f["form"], 0) + f["count"]
+            merged_forms = [{"form": k, "count": v} for k, v in existing_forms.items()]
+            merged_forms.sort(key=lambda x: -x["count"])
+            target_list[existing_idx]["forms"] = merged_forms
+
+        target_list.pop(old_idx)
+    else:
+        if mode == "raw": target_list[old_idx]["word"] = new_val
+        else: target_list[old_idx]["lemma"] = new_val
+
+    target_list.sort(key=lambda x: -x["count"])
+    db_entry["unique_forms"] = len(db_entry.get("raw", []))
+    db_entry["unique_lemmas"] = len(db_entry.get("lemma", []))
+    return jsonify({"ok": True, "updated_data": db_entry})
+
+@app.route("/api/files/<path:fname>/edit_pos", methods=["POST"])
+def edit_pos(fname):
+    if fname not in IN_MEMORY_DB:
+        return jsonify({"error": "Datei nicht im Speicher."}), 404
+
+    data = request.get_json(silent=True) or {}
+    req_mode = data.get("mode")
+    word_val = data.get("word")
+    new_pos = data.get("new_pos")
+
+    if req_mode not in ("raw", "lemma") or not word_val or not new_pos:
+        return jsonify({"error": "Ungültige Eingabe."}), 400
+
+    if new_pos not in POS_MAP:
+        return jsonify({"error": "Unbekannte Wortart."}), 400
+
+    db_entry = IN_MEMORY_DB[fname]
+    target_list = db_entry.get(req_mode, [])
+    lbl, sh = pos_label(new_pos)
+    updated = False
+
+    for item in target_list:
+        key = item.get("word") if req_mode == "raw" else item.get("lemma")
+        if key == word_val:
+            item["pos"] = new_pos
+            item["pos_label"] = lbl
+            item["pos_short"] = sh
+            updated = True
+            break
+
+    if not updated:
+        return jsonify({"error": "Wort nicht gefunden."}), 404
+
+    return jsonify({"ok": True, "updated_data": db_entry})
+
 
 # ── Session persistence routes ─────────────────────────────────────────────────
 @app.route("/api/sessions", methods=["GET"])
@@ -220,7 +330,6 @@ def save_session():
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "Kein Name angegeben."}), 400
-    # Sanitise filename
     safe = re.sub(r'[^\w\-. ]', '_', name)[:80]
     path = SESSIONS_DIR / f"{safe}.json"
     if not IN_MEMORY_DB:
@@ -243,6 +352,16 @@ def load_session():
 
 @app.route("/api/sessions/<name>", methods=["DELETE"])
 def delete_session(name):
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        return jsonify({"error": "Session nicht gefunden."}), 404
+    path.unlink()
+    return jsonify({"ok": True})
+
+@app.route("/api/sessions/delete", methods=["POST"])
+def delete_session_post():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
     path = SESSIONS_DIR / f"{name}.json"
     if not path.exists():
         return jsonify({"error": "Session nicht gefunden."}), 404
@@ -282,9 +401,11 @@ header {
 .logo span { color: var(--red); font-style: italic; }
 .logo-sub { font-family: var(--mono); font-size: 0.62rem; color: var(--muted); letter-spacing: 0.15em; text-transform: uppercase; margin-top: 2px; }
 .header-right { display: flex; align-items: center; gap: 12px; }
-.model-badge { font-family: var(--mono); font-size: 0.65rem; padding: 4px 10px; border: 1px solid; border-radius: 2px; letter-spacing: 0.05em; }
+.model-badge { font-family: var(--mono); font-size: 0.65rem; padding: 4px 10px; border: 1px solid; border-radius: 2px; letter-spacing: 0.05em; display: flex; align-items: center; gap: 6px; transition: all .2s; }
 .model-ok { border-color: #2a5a2a; color: #6dbd6d; background: #0d1f0d; }
 .model-err { border-color: var(--red-dim); color: var(--red); background: #1a0d0e; }
+.model-badge select { background: transparent; color: inherit; border: none; outline: none; cursor: pointer; font-family: var(--mono); font-size: inherit; appearance: none; font-weight: inherit; }
+.model-badge select option { color: #000; }
 
 .file-select {
   background: var(--bg3); color: var(--cream);
@@ -362,11 +483,11 @@ th:hover { color: var(--cream); }
 th.sorted-asc::after { content: ' ↑'; color: var(--red); }
 th.sorted-desc::after { content: ' ↓'; color: var(--red); }
 th.no-sort { cursor: default; } th.no-sort:hover { color: var(--muted); }
-td { padding: 11px 20px; font-size: 0.78rem; border-bottom: 1px solid var(--border); color: var(--cream); vertical-align: top; }
+td { padding: 11px 20px; font-size: 0.78rem; border-bottom: 1px solid var(--border); color: var(--cream); vertical-align: middle; }
 tr.clickable-row:hover td { background: var(--bg2); }
 
 .index-cell { color: var(--muted); font-size: 0.7rem; width: 45px; }
-.word-cell { font-weight: 500; font-size: 0.82rem; }
+.word-cell { font-weight: 500; font-size: 0.82rem; display: flex; align-items: center; justify-content: flex-start; }
 .count-cell { color: var(--gold); font-size: 0.82rem; font-weight: 500; }
 .pos-pill { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 0.62rem; letter-spacing: 0.08em; border: 1px solid; }
 .pos-NOUN, .pos-PROPN { background: #0d1a2e; border-color: #1e3d6e; color: #5b9bd5; }
@@ -379,6 +500,11 @@ tr.clickable-row:hover td { background: var(--bg2); }
 .form-tag { font-size: 0.68rem; padding: 2px 8px; background: var(--bg3); border: 1px solid var(--border2); border-radius: 2px; color: var(--muted2); display: inline-flex; align-items: center; gap: 6px; }
 .form-tag .fc { color: var(--gold); font-size: 0.65rem; }
 .rank-bar { display: inline-block; height: 2px; background: var(--red-dim); vertical-align: middle; margin-left: 8px; border-radius: 1px; max-width: 80px; min-width: 2px; }
+
+.edit-btn { background: none; border: none; color: var(--muted2); font-size: 0.75rem; cursor: pointer; margin-left: 8px; opacity: 0; transition: all .15s; vertical-align: middle; padding: 2px 6px; border-radius: 2px; }
+.edit-btn:hover { color: var(--gold); background: #1a1508; }
+.clickable-row:hover .edit-btn { opacity: 1; }
+.inline-pos-select { background: var(--bg3); color: var(--cream); border: 1px solid var(--gold); font-family: var(--mono); font-size: 0.65rem; padding: 2px; border-radius: 2px; outline: none; }
 
 .tag-btn { background: none; border: 1px solid var(--border2); border-radius: 2px; color: var(--muted); cursor: pointer; font-size: 0.75rem; padding: 2px 7px; line-height: 1; transition: all .15s; }
 .tag-btn:hover { border-color: var(--gold); color: var(--gold); }
@@ -424,12 +550,16 @@ tr.clickable-row:hover td { background: var(--bg2); }
       <div class="logo-sub">Deutsche Frequenzanalyse</div>
     </div>
     <div class="header-right">
-      {% if model_ok %}
-        <div class="model-badge model-ok">de_core_news_sm ✓</div>
-      {% else %}
-        <div class="model-badge model-err" title="{{ model_error }}">Modell fehlt ✗</div>
-      {% endif %}
+      <div class="model-badge {% if model_ok %}model-ok{% else %}model-err{% endif %}" id="model-badge" title="{% if not model_ok %}{{ model_error }}{% endif %}">
+        <select id="model-select" onchange="changeSpacyModel(this.value)">
+          <option value="de_core_news_sm" {% if current_model == 'de_core_news_sm' %}selected{% endif %}>de_core_news_sm</option>
+          <option value="de_core_news_md" {% if current_model == 'de_core_news_md' %}selected{% endif %}>de_core_news_md</option>
+          <option value="de_core_news_lg" {% if current_model == 'de_core_news_lg' %}selected{% endif %}>de_core_news_lg</option>
+        </select>
+        <span id="model-status">{% if model_ok %}✓{% else %}✗{% endif %}</span>
+      </div>
       <select id="file-selector" class="file-select" style="display:none;" onchange="switchFile(this.value)"></select>
+      <button class="new-btn" id="delete-file-btn" style="display:none; color: var(--red); border-color: var(--red-dim);" onclick="deleteCurrentFile()" title="Aktuelle Datei aus dem Speicher löschen">✕ Löschen</button>
       <button class="new-btn" id="upload-more-btn" style="display:none" onclick="show('upload-screen')">+ Dateien</button>
       <div class="session-toggle-btn">
         <button class="new-btn" onclick="toggleSessionPanel()" id="session-btn">💾 Sessions</button>
@@ -491,6 +621,7 @@ tr.clickable-row:hover td { background: var(--bg2); }
       </div>
       <button class="export-btn" onclick="exportCSV()">↓ CSV</button>
       <span class="tagged-badge" id="tagged-badge"></span>
+      <button class="pos-btn" id="filter-tagged-btn" onclick="toggleTaggedFilter()" style="display:none" title="Nur markierte Wörter anzeigen">★ Zeigen</button>
       <button class="anki-btn" onclick="exportAnki(false)" title="Aktuelle Ansicht als Anki-Deck exportieren">↓ Anki</button>
       <button class="anki-btn" id="anki-tagged-btn" onclick="exportAnki(true)" disabled title="Nur markierte Einträge exportieren">↓ Anki (Markiert)</button>
     </div>
@@ -503,8 +634,17 @@ tr.clickable-row:hover td { background: var(--bg2); }
 
 <script>
 let DATA = null; let mode = 'raw'; let posFilter = 'ALL'; let sortCol = 'count'; let sortDir = -1;
-let TAGGED = new Set();
+let TAGGED = new Set(); let showTaggedOnly = false;
 const OTHER_POS = new Set(['DET','PRON','ADP','CCONJ','SCONJ','PART','NUM','INTJ','X']);
+
+const POS_OPTIONS = [
+  {val:'NOUN', label:'Nomen (N)'}, {val:'PROPN', label:'Eigenname (E)'}, {val:'VERB', label:'Verb (V)'},
+  {val:'AUX', label:'Hilfsverb (H)'}, {val:'ADJ', label:'Adjektiv (Adj)'}, {val:'ADV', label:'Adverb (Adv)'},
+  {val:'DET', label:'Artikel (Art)'}, {val:'PRON', label:'Pronomen (Pro)'}, {val:'ADP', label:'Präposition (Prp)'},
+  {val:'CCONJ', label:'Konj. (K)'}, {val:'SCONJ', label:'Konj. (K)'}, {val:'PART', label:'Partikel (Par)'},
+  {val:'NUM', label:'Zahl (Zhl)'}, {val:'INTJ', label:'Interjektion (Inj)'}, {val:'X', label:'Sonstige (?)'}
+];
+
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
 const uploadBtn = document.getElementById('upload-btn');
@@ -519,6 +659,34 @@ window.onload = () => {
         switchFile(INITIAL_FILES[0]);
     }
 };
+
+function changeSpacyModel(newModel) {
+    const badge = document.getElementById('model-badge');
+    const status = document.getElementById('model-status');
+    status.textContent = '…';
+    badge.className = 'model-badge';
+    badge.style.borderColor = 'var(--muted)';
+    badge.style.color = 'var(--muted)';
+
+    fetch('/api/model', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({model: newModel})
+    }).then(r => r.json()).then(data => {
+        if (data.ok) {
+            badge.className = 'model-badge model-ok';
+            badge.style = '';
+            status.textContent = '✓';
+            showToast(`Modell gewechselt zu ${newModel}`);
+        } else {
+            badge.className = 'model-badge model-err';
+            badge.style = '';
+            status.textContent = '✗';
+            badge.title = data.error;
+            showToast(data.error);
+        }
+    }).catch(() => showToast('Fehler beim Modellwechsel.'));
+}
 
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragging'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragging'));
@@ -552,8 +720,91 @@ function doUpload() {
 function updateFileSelector(files) {
   const sel = document.getElementById('file-selector');
   sel.innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
-  sel.style.display = files.length > 0 ? 'inline-block' : 'none';
-  document.getElementById('upload-more-btn').style.display = 'inline-block';
+
+  const hasFiles = files.length > 0;
+  sel.style.display = hasFiles ? 'inline-block' : 'none';
+  document.getElementById('upload-more-btn').style.display = hasFiles ? 'inline-block' : 'none';
+  document.getElementById('delete-file-btn').style.display = hasFiles ? 'inline-block' : 'none';
+}
+
+function deleteCurrentFile() {
+  const sel = document.getElementById('file-selector');
+  const filename = sel.value;
+  if (!filename) return;
+
+  if (!confirm(`Möchtest du "${filename}" wirklich aus dem Speicher löschen?`)) return;
+
+  fetch(`/api/files/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { showToast(data.error); return; }
+      showToast(`"${filename}" wurde gelöscht.`);
+      updateFileSelector(data.files);
+      if (data.files.length > 0) {
+        switchFile(data.files[0]);
+      } else {
+        DATA = null;
+        show('upload-screen');
+        document.getElementById('cancel-upload-btn').style.display = 'none';
+      }
+    })
+    .catch(() => showToast('Fehler beim Löschen der Datei.'));
+}
+
+function editWord(event, oldVal) {
+  event.stopPropagation();
+  const newVal = prompt(`Neuer Wert für "${oldVal}":`, oldVal);
+  if (newVal === null || newVal.trim() === '' || newVal === oldVal) return;
+
+  const filename = DATA.filename;
+  fetch(`/api/files/${encodeURIComponent(filename)}/edit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: mode, old_val: oldVal, new_val: newVal })
+  })
+  .then(r => r.json())
+  .then(res => {
+    if (res.error) { showToast(res.error); return; }
+    DATA = res.updated_data;
+    if (TAGGED.has(oldVal)) { TAGGED.delete(oldVal); TAGGED.add(newVal); }
+    renderStats(); renderTable();
+    showToast(`Wort aktualisiert: ${newVal}`);
+  }).catch(() => showToast('Fehler beim Aktualisieren.'));
+}
+
+function editPos(event, btn) {
+    event.stopPropagation();
+    const key = btn.getAttribute('data-val');
+    const currentPos = btn.getAttribute('data-pos');
+
+    const sel = document.createElement('select');
+    sel.className = 'inline-pos-select';
+    POS_OPTIONS.forEach(opt => {
+        const o = document.createElement('option');
+        o.value = opt.val;
+        o.textContent = opt.label;
+        if (opt.val === currentPos) o.selected = true;
+        sel.appendChild(o);
+    });
+
+    sel.onchange = () => {
+        fetch(`/api/files/${encodeURIComponent(DATA.filename)}/edit_pos`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: mode, word: key, new_pos: sel.value })
+        }).then(r => r.json()).then(res => {
+            if(res.error) { showToast(res.error); renderTable(); return; }
+            DATA = res.updated_data;
+            renderStats(); renderTable();
+            showToast(`Wortart aktualisiert.`);
+        }).catch(() => { showToast('Fehler.'); renderTable(); });
+    };
+    sel.onblur = () => renderTable();
+    sel.onclick = e => e.stopPropagation();
+
+    const td = btn.parentElement;
+    td.innerHTML = '';
+    td.appendChild(sel);
+    sel.focus();
 }
 
 function switchFile(filename) {
@@ -594,8 +845,8 @@ function setPOS(btn) { posFilter = btn.dataset.pos; document.querySelectorAll('.
 
 function renderHead() {
   const cols = mode === 'raw'
-    ? [{key:'index',label:'#',sort:false},{key:'_tag',label:'',sort:false},{key:'word',label:'Wortform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'lemma',label:'Grundform',sort:true}]
-    : [{key:'index',label:'#',sort:false},{key:'_tag',label:'',sort:false},{key:'lemma',label:'Grundform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'forms',label:'Formen',sort:false}];
+    ? [{key:'index',label:'#',sort:false},{key:'_tag',label:'★',sort:true},{key:'word',label:'Wortform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'lemma',label:'Grundform',sort:true}]
+    : [{key:'index',label:'#',sort:false},{key:'_tag',label:'★',sort:true},{key:'lemma',label:'Grundform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'forms',label:'Formen',sort:false}];
   document.getElementById('table-head').innerHTML = '<tr>' + cols.map(c => {
     let cls = c.sort ? (sortCol === c.key ? (sortDir === -1 ? 'sorted-desc' : 'sorted-asc') : '') : 'no-sort';
     return `<th class="${cls}" ${c.sort ? `onclick="sortBy('${c.key}')"` : ''}>${c.label}</th>`;
@@ -605,6 +856,8 @@ function renderHead() {
 function filterRows(rows) {
   const q = document.getElementById('search-input').value.toLowerCase().trim();
   return rows.filter(r => {
+    const key = mode === 'raw' ? r.word : r.lemma;
+    if (showTaggedOnly && !TAGGED.has(key)) return false;
     if (posFilter !== 'ALL' && (posFilter === 'OTHER' ? !OTHER_POS.has(r.pos) : r.pos !== posFilter)) return false;
     if (q) {
       const word = (mode === 'raw' ? r.word : r.lemma).toLowerCase();
@@ -613,13 +866,21 @@ function filterRows(rows) {
     } return true;
   });
 }
+
 function sortRows(rows) {
   return [...rows].sort((a, b) => {
+    if (sortCol === '_tag') {
+      const ka = mode === 'raw' ? a.word : a.lemma;
+      const kb = mode === 'raw' ? b.word : b.lemma;
+      const ta = TAGGED.has(ka) ? 1 : 0, tb = TAGGED.has(kb) ? 1 : 0;
+      return (tb - ta) * sortDir;
+    }
     let va = typeof a[sortCol] === 'string' ? a[sortCol].toLowerCase() : a[sortCol];
     let vb = typeof b[sortCol] === 'string' ? b[sortCol].toLowerCase() : b[sortCol];
     if (va < vb) return -sortDir; if (va > vb) return sortDir; return 0;
   });
 }
+
 function posClass(pos) { return ['NOUN','PROPN'].includes(pos) ? 'pos-NOUN' : ['VERB','AUX'].includes(pos) ? 'pos-VERB' : pos === 'ADJ' ? 'pos-ADJ' : pos === 'ADV' ? 'pos-ADV' : 'pos-OTHER'; }
 function toggleRow(id) { const el = document.getElementById(id); if (el) el.style.display = el.style.display === 'none' ? 'table-row' : 'none'; }
 
@@ -643,18 +904,20 @@ function renderTable() {
     const isTagged = TAGGED.has(key);
     const tagBtn = `<td class="tag-cell" onclick="event.stopPropagation()"><button class="tag-btn ${isTagged ? 'tagged' : ''}" onclick="toggleTag('${esc(key)}')" title="${isTagged ? 'Markierung entfernen' : 'Für Anki markieren'}">${isTagged ? '★' : '☆'}</button></td>`;
     const exHtml = (r.examples||[]).length ? `<ol style="padding-left:18px; margin:0; line-height:1.6; font-family:var(--sans);">${r.examples.map(ex => `<li>${highlightWord(esc(ex), r, mode)}</li>`).join('')}</ol>` : `<span style="color:var(--muted); font-style:italic;">Keine Beispielsätze gefunden.</span>`;
+    const editWordBtn = `<button class="edit-btn" data-val="${esc(key)}" onclick="editWord(event, this.getAttribute('data-val'))" title="Wort bearbeiten">✎</button>`;
+    const editPosBtn = `<button class="edit-btn" data-val="${esc(key)}" data-pos="${r.pos}" onclick="editPos(event, this)" title="Wortart ändern">✎</button>`;
 
     if (mode === 'raw') {
       return `<tr class="clickable-row" style="cursor:pointer;" onclick="toggleRow('${rowId}')">
-        <td class="index-cell">${i + 1}</td>${tagBtn}<td class="word-cell">${esc(r.word)}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
-        <td><span class="pos-pill ${posClass(r.pos)}">${esc(r.pos_short || r.pos_label)}</span></td><td class="lemma-cell">${esc(r.lemma)}</td>
+        <td class="index-cell">${i + 1}</td>${tagBtn}<td class="word-cell">${esc(r.word)}${editWordBtn}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
+        <td style="white-space:nowrap;"><span class="pos-pill ${posClass(r.pos)}">${esc(r.pos_short || r.pos_label)}</span>${editPosBtn}</td><td class="lemma-cell">${esc(r.lemma)}</td>
       </tr>
       <tr id="${rowId}" style="display:none; background:#111 !important;"><td colspan="6" style="padding:14px 20px; border-bottom:1px solid var(--border);"><div style="font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-bottom:8px; text-transform:uppercase;">Kontext:</div>${exHtml}</td></tr>`;
     } else {
       const formsHtml = r.forms.map(f => `<span class="form-tag">${esc(f.form)}<span class="fc">${f.count}</span></span>`).join('');
       return `<tr class="clickable-row" style="cursor:pointer;" onclick="toggleRow('${rowId}')">
-        <td class="index-cell">${i + 1}</td>${tagBtn}<td class="word-cell">${esc(r.lemma)}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
-        <td><span class="pos-pill ${posClass(r.pos)}">${esc(r.pos_short || r.pos_label)}</span></td><td><div class="forms-cell">${formsHtml}</div></td>
+        <td class="index-cell">${i + 1}</td>${tagBtn}<td class="word-cell">${esc(r.lemma)}${editWordBtn}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
+        <td style="white-space:nowrap;"><span class="pos-pill ${posClass(r.pos)}">${esc(r.pos_short || r.pos_label)}</span>${editPosBtn}</td><td><div class="forms-cell">${formsHtml}</div></td>
       </tr>
       <tr id="${rowId}" style="display:none; background:#111 !important;"><td colspan="6" style="padding:14px 20px; border-bottom:1px solid var(--border);"><div style="font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-bottom:8px; text-transform:uppercase;">Kontext:</div>${exHtml}</td></tr>`;
     }
@@ -668,16 +931,28 @@ function toggleTag(key) {
   renderTable();
 }
 
+function toggleTaggedFilter() {
+  showTaggedOnly = !showTaggedOnly;
+  const btn = document.getElementById('filter-tagged-btn');
+  btn.classList.toggle('active', showTaggedOnly);
+  btn.textContent = showTaggedOnly ? '★ Alle zeigen' : '★ Zeigen';
+  renderTable();
+}
+
 function updateTaggedCount() {
   const badge = document.getElementById('tagged-badge');
   const btn = document.getElementById('anki-tagged-btn');
+  const filterBtn = document.getElementById('filter-tagged-btn');
   if (TAGGED.size > 0) {
     badge.textContent = `★ ${TAGGED.size} markiert`;
     badge.style.display = 'inline-block';
     btn.disabled = false;
+    filterBtn.style.display = 'inline-block';
   } else {
     badge.style.display = 'none';
     btn.disabled = true;
+    filterBtn.style.display = 'none';
+    if (showTaggedOnly) { showTaggedOnly = false; filterBtn.classList.remove('active'); }
   }
 }
 
@@ -740,11 +1015,12 @@ function loadSessionList() {
     if (!sessions.length) { list.innerHTML = '<div class="sp-empty">Keine Sessions vorhanden.</div>'; return; }
     list.innerHTML = sessions.map(s => {
       const date = new Date(s.mtime * 1000).toLocaleDateString('de', {day:'2-digit', month:'2-digit', year:'2-digit'});
+      const nameAttr = JSON.stringify(s.name).replace(/"/g, '&quot;');
       return `<div class="sp-item">
         <span class="sp-item-name" title="${esc(s.name)}">${esc(s.name)}</span>
         <span class="sp-item-meta">${s.size_kb} KB · ${date}</span>
-        <button class="sp-load-btn" onclick="loadSession('${esc(s.name)}')">Laden</button>
-        <button class="sp-del-btn" onclick="deleteSession('${esc(s.name)}', this)" title="Löschen">✕</button>
+        <button class="sp-load-btn" data-name="${nameAttr}" onclick="loadSession(JSON.parse(this.dataset.name))">Laden</button>
+        <button class="sp-del-btn" data-name="${nameAttr}" onclick="deleteSession(JSON.parse(this.dataset.name), this)" title="Löschen">✕</button>
       </div>`;
     }).join('');
   });
@@ -775,9 +1051,9 @@ function loadSession(name) {
 
 function deleteSession(name, btn) {
   btn.textContent = '…';
-  fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  fetch('/api/sessions/delete', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name}) })
     .then(r => r.json()).then(data => {
-      if (data.error) { showToast(data.error); return; }
+      if (data.error) { showToast(data.error); loadSessionList(); return; }
       loadSessionList();
     });
 }
@@ -790,7 +1066,7 @@ function exportCSV() {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }));
   a.download = `wortschatz_${mode}_${DATA.filename.replace(/\.[^.]+$/,'')}.csv`; a.click();
 }
-function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function showToast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 4000); }
 </script>
 </body>

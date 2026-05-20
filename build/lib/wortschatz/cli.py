@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 import logging
-from .app import app, load_model, pre_load_path, IN_MEMORY_DB
+from .app import app, load_model, pre_load_path, IN_MEMORY_DB, CURRENT_MODEL
 
 
 def cmd_serve(args):
@@ -12,7 +12,8 @@ def cmd_serve(args):
 
     ok, err = load_model()
     if ok:
-        print("  ✓ spaCy Modell geladen: de_core_news_sm")
+        # Dynamically display the loaded model instead of hardcoding 'sm'
+        print(f"  ✓ spaCy Modell geladen: {CURRENT_MODEL}")
     else:
         print(f"  ✗ Fehler: {err}")
         sys.exit(1)
@@ -69,3 +70,6 @@ def main():
         print("Tipp: Starte den Server mit:  wortschatz serve")
         print("      Mit Dateien:             wortschatz serve ./texte/ --port 8080")
         sys.exit(0)
+
+if __name__ == "__main__":
+    main()
