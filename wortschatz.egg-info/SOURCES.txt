@@ -1,0 +1,12 @@
+LICENSE
+README.md
+pyproject.toml
+wortschatz/__init__.py
+wortschatz/app.py
+wortschatz/cli.py
+wortschatz.egg-info/PKG-INFO
+wortschatz.egg-info/SOURCES.txt
+wortschatz.egg-info/dependency_links.txt
+wortschatz.egg-info/entry_points.txt
+wortschatz.egg-info/requires.txt
+wortschatz.egg-info/top_level.txt
