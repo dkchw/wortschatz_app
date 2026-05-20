@@ -3,9 +3,14 @@ import re
 import json
 from collections import defaultdict
 import os
+from pathlib import Path
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+# ── Session persistence ────────────────────────────────────────────────────────
+SESSIONS_DIR = Path.home() / ".wortschatz" / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Global Session Storage ─────────────────────────────────────────────────────
 # Everything stored here vanishes when you kill the CLI server.
@@ -83,6 +88,9 @@ def analyze_text(text: str):
 
         total_tokens += 1
         word, lm, pos = token.text.lower(), token.lemma_.lower(), token.pos_
+        if pos in ('NOUN', 'PROPN'):
+            word = word[0].upper() + word[1:] if word else word
+            lm   = lm[0].upper()   + lm[1:]   if lm   else lm
         lbl, sh = pos_label(pos)
         sent_text = re.sub(r"\s+", " ", token.sent.text.strip())
 
@@ -191,6 +199,55 @@ def get_file(fname):
     if fname in IN_MEMORY_DB:
         return jsonify(IN_MEMORY_DB[fname])
     return jsonify({"error": "Datei nicht im Speicher."}), 404
+
+
+# ── Session persistence routes ─────────────────────────────────────────────────
+@app.route("/api/sessions", methods=["GET"])
+def list_sessions():
+    sessions = []
+    for p in sorted(SESSIONS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        stat = p.stat()
+        sessions.append({
+            "name": p.stem,
+            "size_kb": round(stat.st_size / 1024, 1),
+            "mtime": stat.st_mtime,
+        })
+    return jsonify(sessions)
+
+@app.route("/api/sessions/save", methods=["POST"])
+def save_session():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Kein Name angegeben."}), 400
+    # Sanitise filename
+    safe = re.sub(r'[^\w\-. ]', '_', name)[:80]
+    path = SESSIONS_DIR / f"{safe}.json"
+    if not IN_MEMORY_DB:
+        return jsonify({"error": "Keine Daten im Speicher."}), 400
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(IN_MEMORY_DB, f, ensure_ascii=False)
+    return jsonify({"ok": True, "name": safe})
+
+@app.route("/api/sessions/load", methods=["POST"])
+def load_session():
+    global IN_MEMORY_DB
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        return jsonify({"error": "Session nicht gefunden."}), 404
+    with open(path, "r", encoding="utf-8") as f:
+        IN_MEMORY_DB = json.load(f)
+    return jsonify({"ok": True, "files": list(IN_MEMORY_DB.keys())})
+
+@app.route("/api/sessions/<name>", methods=["DELETE"])
+def delete_session(name):
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        return jsonify({"error": "Session nicht gefunden."}), 404
+    path.unlink()
+    return jsonify({"ok": True})
 
 
 # ── HTML Frontend ──────────────────────────────────────────────────────────────
@@ -323,8 +380,40 @@ tr.clickable-row:hover td { background: var(--bg2); }
 .form-tag .fc { color: var(--gold); font-size: 0.65rem; }
 .rank-bar { display: inline-block; height: 2px; background: var(--red-dim); vertical-align: middle; margin-left: 8px; border-radius: 1px; max-width: 80px; min-width: 2px; }
 
+.tag-btn { background: none; border: 1px solid var(--border2); border-radius: 2px; color: var(--muted); cursor: pointer; font-size: 0.75rem; padding: 2px 7px; line-height: 1; transition: all .15s; }
+.tag-btn:hover { border-color: var(--gold); color: var(--gold); }
+.tag-btn.tagged { border-color: var(--gold); color: var(--gold); background: #1a1508; }
+.tag-cell { width: 42px; text-align: center; }
+
+.tagged-badge { font-family: var(--mono); font-size: 0.65rem; padding: 5px 12px; border: 1px solid #3a2f12; background: #1a1508; color: var(--gold); border-radius: 2px; letter-spacing: 0.05em; display: none; white-space: nowrap; }
+.anki-btn { padding: 7px 14px; font-family: var(--mono); font-size: 0.67rem; letter-spacing: 0.06em; cursor: pointer; background: none; border: 1px solid #2a3a5a; color: #6090c0; border-radius: 2px; transition: all .15s; white-space: nowrap; }
+.anki-btn:hover:not(:disabled) { border-color: #6090c0; color: #90c0f0; }
+.anki-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
 #toast { position: fixed; bottom: 24px; right: 24px; z-index: 999; background: #1a0d0e; border: 1px solid var(--red-dim); color: var(--red); font-family: var(--mono); font-size: 0.72rem; padding: 12px 20px; border-radius: 2px; max-width: 360px; transform: translateY(20px); opacity: 0; transition: all .2s; pointer-events: none; letter-spacing: 0.04em; }
 #toast.show { transform: translateY(0); opacity: 1; }
+
+/* Session panel */
+#session-panel { display: none; position: absolute; top: calc(100% + 8px); right: 0; width: 340px; background: var(--bg2); border: 1px solid var(--border2); border-radius: 4px; z-index: 200; box-shadow: 0 8px 32px rgba(0,0,0,.6); overflow: hidden; }
+#session-panel.open { display: block; }
+.sp-head { padding: 14px 16px; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.sp-save { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.sp-input { flex: 1; background: var(--bg3); border: 1px solid var(--border2); border-radius: 2px; padding: 7px 10px; font-family: var(--mono); font-size: 0.72rem; color: var(--cream); outline: none; }
+.sp-input:focus { border-color: var(--muted2); }
+.sp-input::placeholder { color: var(--muted); }
+.sp-save-btn { padding: 7px 14px; background: var(--red); color: #fff; border: none; border-radius: 2px; font-family: var(--mono); font-size: 0.7rem; cursor: pointer; white-space: nowrap; transition: background .15s; }
+.sp-save-btn:hover { background: #b82232; }
+.sp-list { max-height: 260px; overflow-y: auto; }
+.sp-empty { padding: 24px 16px; font-family: var(--mono); font-size: 0.7rem; color: var(--muted); text-align: center; }
+.sp-item { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border); transition: background .12s; }
+.sp-item:hover { background: var(--bg3); }
+.sp-item-name { flex: 1; font-family: var(--mono); font-size: 0.75rem; color: var(--cream); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-item-meta { font-family: var(--mono); font-size: 0.62rem; color: var(--muted); white-space: nowrap; }
+.sp-load-btn { padding: 4px 10px; background: none; border: 1px solid var(--border2); border-radius: 2px; font-family: var(--mono); font-size: 0.65rem; color: var(--muted2); cursor: pointer; transition: all .12s; white-space: nowrap; }
+.sp-load-btn:hover { border-color: var(--cream); color: var(--cream); }
+.sp-del-btn { padding: 4px 8px; background: none; border: 1px solid transparent; border-radius: 2px; font-family: var(--mono); font-size: 0.65rem; color: var(--muted); cursor: pointer; transition: all .12s; }
+.sp-del-btn:hover { border-color: var(--red-dim); color: var(--red); }
+.session-toggle-btn { position: relative; }
 </style>
 </head>
 <body>
@@ -342,6 +431,19 @@ tr.clickable-row:hover td { background: var(--bg2); }
       {% endif %}
       <select id="file-selector" class="file-select" style="display:none;" onchange="switchFile(this.value)"></select>
       <button class="new-btn" id="upload-more-btn" style="display:none" onclick="show('upload-screen')">+ Dateien</button>
+      <div class="session-toggle-btn">
+        <button class="new-btn" onclick="toggleSessionPanel()" id="session-btn">💾 Sessions</button>
+        <div id="session-panel">
+          <div class="sp-head">Session speichern</div>
+          <div class="sp-save">
+            <input class="sp-input" id="sp-name-input" placeholder="Name…" maxlength="80"
+              onkeydown="if(event.key==='Enter') saveSession()">
+            <button class="sp-save-btn" onclick="saveSession()">Speichern</button>
+          </div>
+          <div class="sp-head" style="margin-top:0">Gespeicherte Sessions</div>
+          <div class="sp-list" id="sp-list"><div class="sp-empty">Keine Sessions vorhanden.</div></div>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -388,6 +490,9 @@ tr.clickable-row:hover td { background: var(--bg2); }
         <input class="search-input" type="text" id="search-input" placeholder="Suchen…" oninput="renderTable()">
       </div>
       <button class="export-btn" onclick="exportCSV()">↓ CSV</button>
+      <span class="tagged-badge" id="tagged-badge"></span>
+      <button class="anki-btn" onclick="exportAnki(false)" title="Aktuelle Ansicht als Anki-Deck exportieren">↓ Anki</button>
+      <button class="anki-btn" id="anki-tagged-btn" onclick="exportAnki(true)" disabled title="Nur markierte Einträge exportieren">↓ Anki (Markiert)</button>
     </div>
     <div class="table-wrap">
       <table><thead id="table-head"></thead><tbody id="table-body"></tbody></table>
@@ -398,6 +503,7 @@ tr.clickable-row:hover td { background: var(--bg2); }
 
 <script>
 let DATA = null; let mode = 'raw'; let posFilter = 'ALL'; let sortCol = 'count'; let sortDir = -1;
+let TAGGED = new Set();
 const OTHER_POS = new Set(['DET','PRON','ADP','CCONJ','SCONJ','PART','NUM','INTJ','X']);
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
@@ -488,8 +594,8 @@ function setPOS(btn) { posFilter = btn.dataset.pos; document.querySelectorAll('.
 
 function renderHead() {
   const cols = mode === 'raw'
-    ? [{key:'index',label:'#',sort:false},{key:'word',label:'Wortform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'lemma',label:'Grundform',sort:true}]
-    : [{key:'index',label:'#',sort:false},{key:'lemma',label:'Grundform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'forms',label:'Formen',sort:false}];
+    ? [{key:'index',label:'#',sort:false},{key:'_tag',label:'',sort:false},{key:'word',label:'Wortform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'lemma',label:'Grundform',sort:true}]
+    : [{key:'index',label:'#',sort:false},{key:'_tag',label:'',sort:false},{key:'lemma',label:'Grundform',sort:true},{key:'count',label:'Häufigkeit',sort:true},{key:'pos_label',label:'Wortart',sort:true},{key:'forms',label:'Formen',sort:false}];
   document.getElementById('table-head').innerHTML = '<tr>' + cols.map(c => {
     let cls = c.sort ? (sortCol === c.key ? (sortDir === -1 ? 'sorted-desc' : 'sorted-asc') : '') : 'no-sort';
     return `<th class="${cls}" ${c.sort ? `onclick="sortBy('${c.key}')"` : ''}>${c.label}</th>`;
@@ -529,30 +635,153 @@ function renderTable() {
   const sorted = sortRows(filterRows(mode === 'raw' ? DATA.raw : DATA.lemma));
   const maxCount = sorted.length ? sorted[0].count : 1;
   const tbody = document.getElementById('table-body');
-  if (!sorted.length) return tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:40px; color:var(--muted);">Keine Einträge.</td></tr>`;
+  if (!sorted.length) return tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding:40px; color:var(--muted);">Keine Einträge.</td></tr>`;
 
   tbody.innerHTML = sorted.map((r, i) => {
     const barW = Math.round((r.count / maxCount) * 80); const rowId = `ex-${i}`;
+    const key = mode === 'raw' ? r.word : r.lemma;
+    const isTagged = TAGGED.has(key);
+    const tagBtn = `<td class="tag-cell" onclick="event.stopPropagation()"><button class="tag-btn ${isTagged ? 'tagged' : ''}" onclick="toggleTag('${esc(key)}')" title="${isTagged ? 'Markierung entfernen' : 'Für Anki markieren'}">${isTagged ? '★' : '☆'}</button></td>`;
     const exHtml = (r.examples||[]).length ? `<ol style="padding-left:18px; margin:0; line-height:1.6; font-family:var(--sans);">${r.examples.map(ex => `<li>${highlightWord(esc(ex), r, mode)}</li>`).join('')}</ol>` : `<span style="color:var(--muted); font-style:italic;">Keine Beispielsätze gefunden.</span>`;
 
     if (mode === 'raw') {
       return `<tr class="clickable-row" style="cursor:pointer;" onclick="toggleRow('${rowId}')">
-        <td class="index-cell">${i + 1}</td><td class="word-cell">${esc(r.word)}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
+        <td class="index-cell">${i + 1}</td>${tagBtn}<td class="word-cell">${esc(r.word)}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
         <td><span class="pos-pill ${posClass(r.pos)}">${esc(r.pos_short || r.pos_label)}</span></td><td class="lemma-cell">${esc(r.lemma)}</td>
       </tr>
-      <tr id="${rowId}" style="display:none; background:#111 !important;"><td colspan="5" style="padding:14px 20px; border-bottom:1px solid var(--border);"><div style="font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-bottom:8px; text-transform:uppercase;">Kontext:</div>${exHtml}</td></tr>`;
+      <tr id="${rowId}" style="display:none; background:#111 !important;"><td colspan="6" style="padding:14px 20px; border-bottom:1px solid var(--border);"><div style="font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-bottom:8px; text-transform:uppercase;">Kontext:</div>${exHtml}</td></tr>`;
     } else {
       const formsHtml = r.forms.map(f => `<span class="form-tag">${esc(f.form)}<span class="fc">${f.count}</span></span>`).join('');
       return `<tr class="clickable-row" style="cursor:pointer;" onclick="toggleRow('${rowId}')">
-        <td class="index-cell">${i + 1}</td><td class="word-cell">${esc(r.lemma)}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
+        <td class="index-cell">${i + 1}</td>${tagBtn}<td class="word-cell">${esc(r.lemma)}</td><td class="count-cell">${r.count.toLocaleString('de')}<span class="rank-bar" style="width:${barW}px"></span></td>
         <td><span class="pos-pill ${posClass(r.pos)}">${esc(r.pos_short || r.pos_label)}</span></td><td><div class="forms-cell">${formsHtml}</div></td>
       </tr>
-      <tr id="${rowId}" style="display:none; background:#111 !important;"><td colspan="5" style="padding:14px 20px; border-bottom:1px solid var(--border);"><div style="font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-bottom:8px; text-transform:uppercase;">Kontext:</div>${exHtml}</td></tr>`;
+      <tr id="${rowId}" style="display:none; background:#111 !important;"><td colspan="6" style="padding:14px 20px; border-bottom:1px solid var(--border);"><div style="font-family:var(--mono); font-size:0.65rem; color:var(--muted); margin-bottom:8px; text-transform:uppercase;">Kontext:</div>${exHtml}</td></tr>`;
     }
   }).join('');
 }
 
 function sortBy(col) { if (sortCol === col) sortDir *= -1; else { sortCol = col; sortDir = col === 'count' ? -1 : 1; } renderHead(); renderTable(); }
+function toggleTag(key) {
+  if (TAGGED.has(key)) { TAGGED.delete(key); } else { TAGGED.add(key); }
+  updateTaggedCount();
+  renderTable();
+}
+
+function updateTaggedCount() {
+  const badge = document.getElementById('tagged-badge');
+  const btn = document.getElementById('anki-tagged-btn');
+  if (TAGGED.size > 0) {
+    badge.textContent = `★ ${TAGGED.size} markiert`;
+    badge.style.display = 'inline-block';
+    btn.disabled = false;
+  } else {
+    badge.style.display = 'none';
+    btn.disabled = true;
+  }
+}
+
+function buildAnkiBack(r) {
+  const posStr = r.pos_label || r.pos || '';
+  const freqStr = `Häufigkeit: ${r.count}`;
+  const lemmaStr = mode === 'raw' && r.lemma ? `Grundform: <b>${r.lemma}</b>` : '';
+  const formsStr = mode === 'lemma' && r.forms && r.forms.length
+    ? `Formen: ${r.forms.slice(0,8).map(f => f.form).join(', ')}`
+    : '';
+  const examples = (r.examples || []).slice(0, 3);
+  const exHtml = examples.length
+    ? '<hr style="margin:6px 0; border-color:#555">' + examples.map(ex => `<div style="font-size:0.9em; color:#bbb; margin:3px 0">· ${ex}</div>`).join('')
+    : '';
+  return [posStr, freqStr, lemmaStr, formsStr].filter(Boolean).join('<br>') + exHtml;
+}
+
+function exportAnki(taggedOnly) {
+  const rows = mode === 'raw' ? DATA.raw : DATA.lemma;
+  let items = taggedOnly
+    ? rows.filter(r => TAGGED.has(mode === 'raw' ? r.word : r.lemma))
+    : filterRows(rows);
+  if (!items.length) { showToast('Keine Einträge zum Exportieren.'); return; }
+
+  const srcTag = DATA.filename.replace(/\.[^.]+$/, '').replace(/\s+/g, '_').toLowerCase();
+  const lines = ['#separator:tab', '#html:true', '#notetype column:3', 'Vorderseite\tRückseite\tNotiztyp\tTags'];
+  items.forEach(r => {
+    const front = esc(mode === 'raw' ? r.word : r.lemma);
+    const back = buildAnkiBack(r);
+    const tags = `wortschatz ${srcTag} ${(r.pos_label || '').toLowerCase().replace(/\s+/g,'_')}`;
+    lines.push(`${front}\t${back}\tBasic\t${tags}`);
+  });
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  const suffix = taggedOnly ? '_markiert' : `_${mode}`;
+  a.href = URL.createObjectURL(blob);
+  a.download = `wortschatz_anki${suffix}_${srcTag}.txt`;
+  a.click();
+  showToast(`${items.length} Karten exportiert.`);
+}
+
+// ── Session management ────────────────────────────────────────────────────────
+function toggleSessionPanel() {
+  const panel = document.getElementById('session-panel');
+  const isOpen = panel.classList.toggle('open');
+  if (isOpen) { loadSessionList(); document.getElementById('sp-name-input').focus(); }
+}
+
+document.addEventListener('click', e => {
+  const panel = document.getElementById('session-panel');
+  const btn = document.getElementById('session-btn');
+  if (panel.classList.contains('open') && !panel.contains(e.target) && !btn.contains(e.target))
+    panel.classList.remove('open');
+});
+
+function loadSessionList() {
+  fetch('/api/sessions').then(r => r.json()).then(sessions => {
+    const list = document.getElementById('sp-list');
+    if (!sessions.length) { list.innerHTML = '<div class="sp-empty">Keine Sessions vorhanden.</div>'; return; }
+    list.innerHTML = sessions.map(s => {
+      const date = new Date(s.mtime * 1000).toLocaleDateString('de', {day:'2-digit', month:'2-digit', year:'2-digit'});
+      return `<div class="sp-item">
+        <span class="sp-item-name" title="${esc(s.name)}">${esc(s.name)}</span>
+        <span class="sp-item-meta">${s.size_kb} KB · ${date}</span>
+        <button class="sp-load-btn" onclick="loadSession('${esc(s.name)}')">Laden</button>
+        <button class="sp-del-btn" onclick="deleteSession('${esc(s.name)}', this)" title="Löschen">✕</button>
+      </div>`;
+    }).join('');
+  });
+}
+
+function saveSession() {
+  const name = document.getElementById('sp-name-input').value.trim();
+  if (!name) { showToast('Bitte einen Namen eingeben.'); return; }
+  fetch('/api/sessions/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name}) })
+    .then(r => r.json()).then(data => {
+      if (data.error) { showToast(data.error); return; }
+      document.getElementById('sp-name-input').value = '';
+      showToast(`Session „${data.name}" gespeichert.`);
+      loadSessionList();
+    });
+}
+
+function loadSession(name) {
+  fetch('/api/sessions/load', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name}) })
+    .then(r => r.json()).then(data => {
+      if (data.error) { showToast(data.error); return; }
+      document.getElementById('session-panel').classList.remove('open');
+      updateFileSelector(data.files);
+      if (data.files.length) switchFile(data.files[0]);
+      showToast(`Session „${name}" geladen (${data.files.length} Datei(en)).`);
+    });
+}
+
+function deleteSession(name, btn) {
+  btn.textContent = '…';
+  fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    .then(r => r.json()).then(data => {
+      if (data.error) { showToast(data.error); return; }
+      loadSessionList();
+    });
+}
+
 function exportCSV() {
   const filtered = filterRows(mode === 'raw' ? DATA.raw : DATA.lemma);
   const csv = mode === 'raw'
